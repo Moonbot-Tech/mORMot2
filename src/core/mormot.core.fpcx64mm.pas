@@ -133,6 +133,15 @@ unit mormot.core.fpcx64mm;
 // - warning: EXPERIMENTAL Linux and Win64 ONLY, due to very low-level asm trick
 {.$define FPCMM_TINYPERTHREAD}
 
+// enable multiple arenas for all small sizes and, on Linux, user medium blocks
+{.$define FPCMM_SCALABLE}
+{$ifdef FPCMM_SCALABLE}
+  {$define FPCMM_TINYPERTHREAD}
+  {$ifdef LINUX}
+    {$define FPCMM_SCALABLE_MEDIUM}
+  {$endif LINUX}
+{$endif FPCMM_SCALABLE}
+
 // use "rep movsb/stosd" ERMS for blocks > 256 bytes instead of SSE2 "movaps"
 // - ERMS is available since Ivy Bridge, and we use "movaps" for smallest blocks
 // (to not slow down older CPUs), so it is safe to enable this on FPCMM_SERVER
@@ -382,6 +391,7 @@ const
     {$endif BSD}
     {$ifdef FPCMM_SMALLNOTWITHMEDIUM}+ ' smallpool'
       {$ifdef FPCMM_MULTIPLESMALLNOTWITHMEDIUM} + 's' {$endif} {$endif}
+    {$ifdef FPCMM_SCALABLE}          + ' scalable'    {$endif}
     {$ifdef FPCMM_TINYPERTHREAD}     + ' perthrd'  {$endif}
     {$ifdef FPCMM_ERMS}              + ' erms'        {$endif}
     {$ifdef FPCMM_DEBUG}             + ' debug'       {$endif}
@@ -630,6 +640,11 @@ const
   MAP_LARGE = MAP_PRIVATE or MAP_ANONYMOUS
      {$ifdef FPCMM_LARGEPOPULATE} or MAP_POPULATE {$endif};
 
+  {$ifdef FPCMM_SCALABLE_MEDIUM}
+  MediumBlockAlignment     = 1 shl 21; // resolve pool header from any block
+  MediumBlockAlignmentMask = MediumBlockAlignment - 1;
+  {$endif FPCMM_SCALABLE_MEDIUM}
+
 {$ifdef FPCMM_MEDIUM32BIT}
 var
   AllocMediumflags: integer = MAP_MEDIUM;
@@ -637,7 +652,7 @@ var
   AllocMediumflags = MAP_MEDIUM;
 {$endif FPCMM_MEDIUM32BIT}
 
-function OsAllocMedium(Size: PtrInt): pointer; 
+function OsAllocMediumRaw(Size: PtrInt): pointer;
 begin
   result := fpmmap(nil, Size, PROT_READ or PROT_WRITE, AllocMediumflags, -1, 0);
   if result = MAP_FAILED then
@@ -648,8 +663,38 @@ begin
     exit;
   // try with no 2GB limit from now on
   AllocMediumflags := AllocMediumflags and not MAP_32BIT;
-  result := OsAllocMedium(Size);
+  result := OsAllocMediumRaw(Size);
   {$endif FPCMM_MEDIUM32BIT}
+end;
+
+function OsAllocMedium(Size: PtrInt): pointer;
+{$ifdef FPCMM_SCALABLE_MEDIUM}
+var
+  raw: pointer;
+  allocsize, prefix, suffix: PtrInt;
+{$endif FPCMM_SCALABLE_MEDIUM}
+begin
+  {$ifdef FPCMM_SCALABLE_MEDIUM}
+  // Keep the existing 1.25MB pool size, but map it at a 2MB boundary so its
+  // immutable owner can be read from the pool header on FreeMem/ReallocMem.
+  allocsize := Size + MediumBlockAlignment;
+  raw := OsAllocMediumRaw(allocsize);
+  if raw = nil then
+  begin
+    result := nil;
+    exit;
+  end;
+  result := pointer((PtrUInt(raw) + MediumBlockAlignmentMask) and
+    not MediumBlockAlignmentMask);
+  prefix := PtrUInt(result) - PtrUInt(raw);
+  if prefix <> 0 then
+    fpmunmap(raw, prefix);
+  suffix := allocsize - prefix - Size;
+  if suffix <> 0 then
+    fpmunmap(PByte(result) + Size, suffix);
+  {$else}
+  result := OsAllocMediumRaw(Size);
+  {$endif FPCMM_SCALABLE_MEDIUM}
 end;
 
 function OsAllocLarge(Size: PtrInt): pointer; inline;
@@ -809,7 +854,9 @@ asm
         jbe     @s
         mov     qword ptr [Arena].TMMStatusArena.PeakBytes, rax
 @s:     {$else}
+        {$ifdef FPCMM_SCALABLE_MEDIUM} lock {$endif}
         add     qword ptr [Arena].TMMStatusArena.CurrentBytes, Size
+        {$ifdef FPCMM_SCALABLE_MEDIUM} lock {$endif}
         add     qword ptr [Arena].TMMStatusArena.CumulativeBytes, Size
        {$endif FPCMM_DEBUG}
 end;
@@ -822,6 +869,7 @@ asm
    lock add     qword ptr [Arena].TMMStatusArena.CurrentBytes, Size
    lock inc     qword ptr [Arena].TMMStatusArena.CumulativeFree
         {$else}
+        {$ifdef FPCMM_SCALABLE_MEDIUM} lock {$endif}
         add     qword ptr [Arena].TMMStatusArena.CurrentBytes, Size
         {$endif FPCMM_DEBUG}
 end;
@@ -838,6 +886,10 @@ end;
 
 const
   // define maximum size of tiny blocks, and the number of arenas
+  {$ifdef FPCMM_SCALABLE}
+  NumTinyBlockTypesPO2  = 6; // ALL 64 unique classes are arena-sharded
+  NumTinyBlockArenasPO2 = 5; // 32 arenas
+  {$else}
   {$ifdef FPCMM_BOOSTER}
   NumTinyBlockTypesPO2  = 4; // tiny are <= 256 bytes
   NumTinyBlockArenasPO2 = 7; // 128 arenas
@@ -851,10 +903,18 @@ const
     NumTinyBlockArenasPO2 = 3; // 8 round-robin arenas (including Small[])
     {$endif FPCMM_BOOST}
   {$endif FPCMM_BOOSTER}
+  {$endif FPCMM_SCALABLE}
 
+  {$ifdef FPCMM_SCALABLE}
+  // 64 unique size classes up to 17504 bytes, all arena-sharded.
+  NumSmallBlockTypes       = 66;
+  NumSmallBlockTypesUnique = NumSmallBlockTypes - 2; // last 2 are redundant
+  MaximumSmallBlockSize    = 17504;
+  {$else}
   NumSmallBlockTypes       = 46;
   NumSmallBlockTypesUnique = NumSmallBlockTypes - 2; // last 2 are redundant
   MaximumSmallBlockSize    = 2608;
+  {$endif FPCMM_SCALABLE}
   NumTinyBlockTypes        =
      1 shl NumTinyBlockTypesPO2; // 8 (128B) or 16 (256B)
   NumTinyBlockArenas       =
@@ -865,6 +925,10 @@ const
     16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256,
     272, 288, 304, 320, 352, 384, 416, 448, 480, 528, 576, 624, 672, 736, 800,
     880, 960, 1056, 1152, 1264, 1376, 1504, 1648, 1808, 1984, 2176, 2384,
+    {$ifdef FPCMM_SCALABLE}
+    2608, 2864, 3152, 3472, 3808, 4192, 4608, 5072, 5584, 6144, 6752, 7424,
+    8176, 8992, 9888, 10880, 11968, 13168, 14480, 15920,
+    {$endif FPCMM_SCALABLE}
     MaximumSmallBlockSize, MaximumSmallBlockSize, MaximumSmallBlockSize);
 
   SmallBlockGranularity        = 16;
@@ -876,6 +940,10 @@ const
 
   MediumBlockPoolSizeMem       = 20 * 64 * 1024;
   MediumBlockPoolSize          = MediumBlockPoolSizeMem - 16;
+  {$ifdef FPCMM_SCALABLE_MEDIUM}
+  NumMediumBlockArenasPO2      = NumTinyBlockArenasPO2;
+  NumMediumBlockArenas         = 1 shl NumMediumBlockArenasPO2;
+  {$endif FPCMM_SCALABLE_MEDIUM}
   MediumBlockSizeOffset        = 48;
   MinimumMediumBlockSize       = 11 * 256 + MediumBlockSizeOffset;
   MediumBlockBinsPerGroup      = 32;
@@ -887,6 +955,7 @@ const
   OptimalSmallBlockPoolSizeLowerLimit =
     29 * 1024 - MediumBlockGranularity + MediumBlockSizeOffset;
   OptimalSmallBlockPoolSizeUpperLimit =
+    // hard ceiling: these pool-size fields are stored as Word
     64 * 1024 - MediumBlockGranularity + MediumBlockSizeOffset;
   MaximumSmallBlockPoolSize   =
     OptimalSmallBlockPoolSizeUpperLimit + MinimumMediumBlockSize;
@@ -1044,6 +1113,10 @@ const
 var
   SmallBlockInfo: TSmallBlockInfo;
   MediumBlockInfo: TMediumBlockInfo;
+  {$ifdef FPCMM_SCALABLE_MEDIUM}
+  MediumBlockInfoExtra: array[1..NumMediumBlockArenas - 1] of TMediumBlockInfo;
+  MediumBlockInfoLookup: array[0..NumMediumBlockArenas - 1] of PMediumBlockInfo;
+  {$endif FPCMM_SCALABLE_MEDIUM}
   {$ifdef FPCMM_SMALLNOTWITHMEDIUM}
   {$ifdef FPCMM_MULTIPLESMALLNOTWITHMEDIUM}
   SmallMediumBlockInfo: array[0.. (NumTinyBlockTypes * 2) - 2] of TMediumBlockInfo;
@@ -1406,6 +1479,10 @@ begin
     new := OsAllocMedium(MediumBlockPoolSizeMem);
   if new <> nil then
   begin
+    {$ifdef FPCMM_SCALABLE_MEDIUM}
+    // Written once before the pool becomes reachable from any shared list.
+    PMediumBlockPoolHeader(new).Reserved1 := PtrUInt(@Info);
+    {$endif FPCMM_SCALABLE_MEDIUM}
     old := Info.PoolsCircularList.NextMediumBlockPoolHeader;
     PMediumBlockPoolHeader(new).PreviousMediumBlockPoolHeader := @Info.PoolsCircularList;
     Info.PoolsCircularList.NextMediumBlockPoolHeader := new;
@@ -2041,6 +2118,21 @@ asm
 @NotTinySmallBlock:
         // Do we need a Large block?
         lea     r10, [rip + MediumBlockInfo]
+        {$ifdef FPCMM_SCALABLE_MEDIUM}
+        xor     r9d, r9d
+        mov     rax, qword ptr [rbx].TSmallBlockInfo.IsMultiThreadPtr
+        cmp     byte ptr [rax], false
+        je      @MediumArenaSelected
+        mov     edx, $9E3779B1 // same per-thread hash as tiny/small arenas
+        // mov rax,fs:[$00000010] = inlined pthread_self on Linux X86_64
+        db $64, $48, $8B, $04, $25, $10, $00, $00, $00
+        mul     edx
+        shr     eax, 32 - NumMediumBlockArenasPO2
+        mov     r9d, eax
+        lea     r10, [rip + MediumBlockInfoLookup]
+        mov     r10, [r10 + rax * 8]
+@MediumArenaSelected:
+        {$endif FPCMM_SCALABLE_MEDIUM}
         cmp     rcx, MaximumMediumBlockSize - BlockHeaderSize
         ja      @IsALargeBlockRequest
         // Get the bin size for this block size (rounded up to the next bin size)
@@ -2056,6 +2148,21 @@ asm
         mov     eax, $100
   lock  cmpxchg byte ptr [rcx].TMediumBlockInfo.Locked, ah
         je      @MediumLocked2
+        {$ifdef FPCMM_SCALABLE_MEDIUM}
+        // Any arena is valid. Try all others before waiting on a collision.
+        mov     r8d, NumMediumBlockArenas - 1
+@TryNextMediumArena:
+        inc     r9d
+        and     r9d, NumMediumBlockArenas - 1
+        lea     r10, [rip + MediumBlockInfoLookup]
+        mov     r10, [r10 + r9 * 8]
+        mov     rcx, r10
+        mov     eax, $100
+  lock  cmpxchg byte ptr [rcx].TMediumBlockInfo.Locked, ah
+        je      @MediumLocked2
+        dec     r8d
+        jnz     @TryNextMediumArena
+        {$endif FPCMM_SCALABLE_MEDIUM}
         call    LockMediumBlocks
 @MediumLocked2:
         // Compute ecx = bin number in ecx and edx = group number
@@ -2111,11 +2218,20 @@ asm
         lea     rdx, [rip + MediumBlockInfo]
         {$else}
         mov     edi, ebx
+        {$ifdef FPCMM_SCALABLE_MEDIUM}
+        mov     rbx, r10 // preserve selected arena across the Pascal call
+        mov     rsi, rbx
+        {$else}
         lea     rsi, [rip + MediumBlockInfo]
+        {$endif FPCMM_SCALABLE_MEDIUM}
         {$endif MSWINDOWS}
         // on input: ecx/edi=BlockSize, rdx/rsi=Info
         call    AllocNewSequentialFeedMediumPool
+        {$ifdef FPCMM_SCALABLE_MEDIUM}
+        mov     byte ptr [rbx + TMediumBlockInfo.Locked], false
+        {$else}
         mov     byte ptr [rip + MediumBlockInfo.Locked], false
+        {$endif FPCMM_SCALABLE_MEDIUM}
         {$ifdef NOSFRAME}
         pop     rbx
         ret
@@ -2446,9 +2562,18 @@ asm
         // rbx=TSmallBlockType rcx=P rdx=TSmallBlockPoolHeader
         jmp     @FreeAndUnlock // will loop until LastFreeCount=0
 @NotSmallBlockInUse:
-        lea     r10, [rip + MediumBlockInfo]
         test    dl, IsFreeBlockFlag + IsLargeBlockFlag
         // P is still in rcx/rdi first param register
+        {$ifdef FPCMM_SCALABLE_MEDIUM}
+        jnz     @FreeLarge
+        mov     r10, rcx
+        and     r10, not MediumBlockAlignmentMask
+        mov     r10, [r10 + TMediumBlockPoolHeader.Reserved1]
+        jmp     FreeMediumBlock
+@FreeLarge:
+        jmp     FreeLargeBlock
+        {$else}
+        lea     r10, [rip + MediumBlockInfo]
         {$ifdef NOSFRAME}
         jz      FreeMediumBlock
         jmp     FreeLargeBlock // local function returns 0 or the block size
@@ -2459,6 +2584,7 @@ asm
 @Medium:call    FreeMediumBlock
         jmp     @Quit
         {$endif NOSFRAME}
+        {$endif FPCMM_SCALABLE_MEDIUM}
 @TinySmallLocked:
         // This small block is locked: add rcx=P to the LastFree list block
         mov     rax, rbx
@@ -2593,7 +2719,13 @@ asm
         // -------------- MEDIUM block -------------
         // rcx=CurrentSize+Flags, r14=P, rdx=RequestedSize, r10=TMediumBlockInfo
         lea     rsi, [rdx + rdx]
+        {$ifdef FPCMM_SCALABLE_MEDIUM}
+        mov     r10, r14
+        and     r10, not MediumBlockAlignmentMask
+        mov     r10, [r10 + TMediumBlockPoolHeader.Reserved1]
+        {$else}
         lea     r10, [rip + MediumBlockInfo]
+        {$endif FPCMM_SCALABLE_MEDIUM}
         mov     rbx, rcx
         and     ecx, DropMediumAndLargeFlagsMask
         lea     rdi, [r14 + rcx]
@@ -3360,7 +3492,16 @@ var
   small: PSmallBlockType;
   a, i, min, poolsize, num, perpool, size, start, next: PtrInt;
 begin
+  {$ifdef FPCMM_SCALABLE_MEDIUM}
+  MediumBlockInfoLookup[0] := @MediumBlockInfo;
+  for i := 1 to high(MediumBlockInfoLookup) do
+    MediumBlockInfoLookup[i] := @MediumBlockInfoExtra[i];
+  {$endif FPCMM_SCALABLE_MEDIUM}
   InitializeMediumPool(MediumBlockInfo);
+  {$ifdef FPCMM_SCALABLE_MEDIUM}
+  for i := 1 to high(MediumBlockInfoExtra) do
+    InitializeMediumPool(MediumBlockInfoExtra[i]);
+  {$endif FPCMM_SCALABLE_MEDIUM}
   {$ifdef FPCMM_SMALLNOTWITHMEDIUM}
   for i := 0 to high(SmallMediumBlockInfo) do
     InitializeMediumPool(SmallMediumBlockInfo[i]);
@@ -3687,6 +3828,10 @@ begin
   for i := 0 to high(SmallMediumBlockInfo) do
     FreeMediumPool(SmallMediumBlockInfo[i]);
   {$endif FPCMM_SMALLNOTWITHMEDIUM}
+  {$ifdef FPCMM_SCALABLE_MEDIUM}
+  for i := 1 to high(MediumBlockInfoExtra) do
+    FreeMediumPool(MediumBlockInfoExtra[i]);
+  {$endif FPCMM_SCALABLE_MEDIUM}
   FreeMediumPool(MediumBlockInfo);
   {$ifdef FPCMM_REPORTMEMORYLEAKS_EXPERIMENTAL}
   if ObjectLeaksCount <> 0 then
